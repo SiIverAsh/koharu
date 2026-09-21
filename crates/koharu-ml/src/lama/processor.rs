@@ -126,7 +126,7 @@ impl InpaintModel {
         let model_image = pad_img_to_modulo(image_tensor.to_kind(Kind::Float) / 255.0, 8);
         let model_mask = pad_img_to_modulo(mask_tensor.gt(0.0).to_kind(Kind::Float), 8);
         let output = model
-            .forward(&model_image, &model_mask)
+            .forward(&model_image, &model_mask)?
             .narrow(2, 0, i64::from(height))
             .narrow(3, 0, i64::from(width))
             .clamp(0.0, 1.0)

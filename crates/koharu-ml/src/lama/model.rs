@@ -34,14 +34,14 @@ impl Model {
         Ok(())
     }
 
-    pub fn forward(&self, image: &Tensor, mask: &Tensor) -> Tensor {
+    pub fn forward(&self, image: &Tensor, mask: &Tensor) -> Result<Tensor> {
         let image = image.to_kind(self.vs.kind());
         let mask = mask.to_kind(self.vs.kind());
         let inverse_mask = mask.ones_like() - &mask;
         let masked_image = &image * &inverse_mask;
         let input = Tensor::cat(&[masked_image, mask.shallow_clone()], 1);
-        let predicted = self.generator.forward(&input);
-        predicted * mask + inverse_mask * image
+        let predicted = self.generator.forward(&input)?;
+        Ok(predicted * mask + inverse_mask * image)
     }
 }
 
@@ -152,21 +152,22 @@ impl FFCResNetGenerator {
         }
     }
 
-    fn forward(&self, input: &Tensor) -> Tensor {
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
         let input = input.reflection_pad2d([3, 3, 3, 3]);
-        let mut pair = self.initial.forward((input, None));
+        let mut pair = self.initial.forward((input, None))?;
         for layer in &self.downsample {
-            pair = layer.forward(pair);
+            pair = layer.forward(pair)?;
         }
         for block in &self.blocks {
-            pair = block.forward(pair);
+            pair = block.forward(pair)?;
         }
 
         let x = self.concat_tuple.forward(pair);
         let x = self.upsample.forward_t(&x, false);
-        self.final_conv
+        Ok(self
+            .final_conv
             .forward(&x.reflection_pad2d([3, 3, 3, 3]))
-            .sigmoid()
+            .sigmoid())
     }
 }
 
@@ -202,11 +203,11 @@ impl FFCResnetBlock {
         }
     }
 
-    fn forward(&self, input: (Tensor, Option<Tensor>)) -> (Tensor, Option<Tensor>) {
+    fn forward(&self, input: (Tensor, Option<Tensor>)) -> Result<(Tensor, Option<Tensor>)> {
         let id_l = input.0.shallow_clone();
         let id_g = input.1.as_ref().map(Tensor::shallow_clone);
-        let output = self.conv2.forward(self.conv1.forward(input));
-        (
+        let output = self.conv2.forward(self.conv1.forward(input)?)?;
+        Ok((
             output.0 + id_l,
             match (output.1, id_g) {
                 (Some(output), Some(id)) => Some(output + id),
@@ -214,7 +215,7 @@ impl FFCResnetBlock {
                 (None, Some(id)) => Some(id),
                 (None, None) => None,
             },
-        )
+        ))
     }
 }
 
@@ -265,8 +266,8 @@ impl FFC_BN_ACT {
         }
     }
 
-    fn forward(&self, input: (Tensor, Option<Tensor>)) -> (Tensor, Option<Tensor>) {
-        let output = self.ffc.forward(input);
+    fn forward(&self, input: (Tensor, Option<Tensor>)) -> Result<(Tensor, Option<Tensor>)> {
+        let output = self.ffc.forward(input)?;
         let local = self
             .bn_l
             .as_ref()
@@ -283,7 +284,7 @@ impl FFC_BN_ACT {
             (None, _) => None,
         };
 
-        (local, global)
+        Ok((local, global))
     }
 }
 
@@ -358,7 +359,7 @@ impl FFC {
         }
     }
 
-    fn forward(&self, input: (Tensor, Option<Tensor>)) -> (Tensor, Option<Tensor>) {
+    fn forward(&self, input: (Tensor, Option<Tensor>)) -> Result<(Tensor, Option<Tensor>)> {
         let local_from_local = self.convl2l.as_ref().map(|conv| conv.forward(&input.0));
         let local_from_global = match (self.convg2l.as_ref(), input.1.as_ref()) {
             (Some(conv), Some(global)) => Some(conv.forward(global)),
@@ -366,7 +367,7 @@ impl FFC {
         };
         let global_from_local = self.convl2g.as_ref().map(|conv| conv.forward(&input.0));
         let global_from_global = match (self.convg2g.as_ref(), input.1.as_ref()) {
-            (Some(conv), Some(global)) => Some(conv.forward(global)),
+            (Some(conv), Some(global)) => Some(conv.forward(global)?),
             _ => None,
         };
 
@@ -380,7 +381,7 @@ impl FFC {
             (Some(output), None) | (None, Some(output)) => Some(output),
             (None, None) => None,
         };
-        (local, global)
+        Ok((local, global))
     }
 }
 
@@ -423,7 +424,7 @@ impl SpectralTransform {
         }
     }
 
-    fn forward(&self, input: &Tensor) -> Tensor {
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
         let input = if self.stride == 2 {
             input.avg_pool2d([2, 2], [2, 2], [0, 0], false, true, None)
         } else {
@@ -433,8 +434,8 @@ impl SpectralTransform {
             .bn1
             .forward_t(&self.conv1.forward(&input), false)
             .relu();
-        let output = self.fu.forward(&x);
-        self.conv2.forward(&(x + output))
+        let output = self.fu.forward(&x)?;
+        Ok(self.conv2.forward(&(x + output)))
     }
 }
 
@@ -461,7 +462,7 @@ impl FourierUnit {
         }
     }
 
-    fn forward(&self, input: &Tensor) -> Tensor {
+    fn forward(&self, input: &Tensor) -> Result<Tensor> {
         let size = input.size();
         let batch = size[0];
         let height = size[2];
@@ -474,9 +475,10 @@ impl FourierUnit {
         let fft_dims = [-2, -1];
         // torch.fft does not support BF16. Keep only the FFT boundary in FP32;
         // the learned convolution and batch normalization remain in the model dtype.
-        let ffted = input
-            .to_kind(Kind::Float)
-            .fft_rfftn(None::<&[i64]>, &fft_dims[..], "ortho");
+        let ffted =
+            input
+                .to_kind(Kind::Float)
+                .f_fft_rfftn(None::<&[i64]>, &fft_dims[..], "ortho")?;
         let ffted = Tensor::stack(&[ffted.real(), ffted.imag()], -1)
             .permute([0, 1, 4, 2, 3])
             .contiguous()
@@ -496,9 +498,9 @@ impl FourierUnit {
         let ffted = ffted.to_kind(Kind::Float);
         let ffted = Tensor::complex(&ffted.select(-1, 0), &ffted.select(-1, 1));
         let output_size = [height, width];
-        ffted
-            .fft_irfftn(&output_size[..], &fft_dims[..], "ortho")
-            .to_kind(model_kind)
+        Ok(ffted
+            .f_fft_irfftn(&output_size[..], &fft_dims[..], "ortho")?
+            .to_kind(model_kind))
     }
 }
 
